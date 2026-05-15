@@ -4,7 +4,7 @@ use crate::config::{
     WebhookConfig, WecomAppConfig, WecomRobotConfig,
 };
 use crate::db::{CallRecord, SmsMessage};
-use crate::models::DdnsEvent;
+use crate::models::{DdnsEvent, VersionUpdateEvent};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -39,6 +39,11 @@ struct WecomTokenResponse {
 enum WecomMessageError {
     InvalidAccessToken(String),
     Other(String),
+}
+
+pub struct NotificationFanoutResult {
+    pub delivered: bool,
+    pub errors: Vec<String>,
 }
 
 impl NotificationSender {
@@ -114,6 +119,43 @@ impl NotificationSender {
 
         if errors.is_empty() {
             Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    pub fn has_version_update_targets(&self) -> bool {
+        let config = self.get_config();
+        all_channels()
+            .into_iter()
+            .any(|channel| should_send_update_to_channel(channel, &config))
+    }
+
+    /// Forward a newly available version update to enabled channels.
+    pub async fn forward_version_update_event(
+        &self,
+        event: &VersionUpdateEvent,
+    ) -> Result<NotificationFanoutResult, String> {
+        let config = self.get_config();
+        let mut delivered = false;
+        let mut errors = Vec::new();
+
+        for channel in all_channels() {
+            if !should_send_update_to_channel(channel, &config) {
+                continue;
+            }
+
+            match self
+                .send_version_update_to_channel(channel, &config, event)
+                .await
+            {
+                Ok(_) => delivered = true,
+                Err(err) => errors.push(format!("{}: {}", channel.label(), err)),
+            }
+        }
+
+        if delivered || errors.is_empty() {
+            Ok(NotificationFanoutResult { delivered, errors })
         } else {
             Err(errors.join("; "))
         }
@@ -252,6 +294,49 @@ impl NotificationSender {
         }
     }
 
+    async fn send_version_update_to_channel(
+        &self,
+        channel: NotificationChannel,
+        config: &NotificationConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        match channel {
+            NotificationChannel::Webhook => {
+                self.send_webhook_version_update(&config.webhook, event)
+                    .await
+            }
+            NotificationChannel::Bark => self.send_bark_version_update(&config.bark, event).await,
+            NotificationChannel::PushPlus => {
+                self.send_pushplus_version_update(&config.pushplus, event)
+                    .await
+            }
+            NotificationChannel::WecomApp => {
+                self.send_wecom_app_version_update(&config.wecom_app, event)
+                    .await
+            }
+            NotificationChannel::WecomRobot => {
+                self.send_wecom_robot_version_update(&config.wecom_robot, event)
+                    .await
+            }
+            NotificationChannel::DingtalkRobot => {
+                self.send_dingtalk_robot_version_update(&config.dingtalk_robot, event)
+                    .await
+            }
+            NotificationChannel::DingtalkApp => {
+                self.send_dingtalk_app_version_update(&config.dingtalk_app, event)
+                    .await
+            }
+            NotificationChannel::FeishuRobot => {
+                self.send_feishu_robot_version_update(&config.feishu_robot, event)
+                    .await
+            }
+            NotificationChannel::Telegram => {
+                self.send_telegram_version_update(&config.telegram, event)
+                    .await
+            }
+        }
+    }
+
     async fn send_webhook_sms(
         &self,
         config: &WebhookConfig,
@@ -299,6 +384,22 @@ impl NotificationSender {
         }
 
         let payload = render_ddns_template(&config.ddns_template, event, true);
+        self.send_webhook_raw(config, &payload).await
+    }
+
+    async fn send_webhook_version_update(
+        &self,
+        config: &WebhookConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !config.enabled || !config.forward_updates {
+            return Ok("Webhook skipped".to_string());
+        }
+        if config.url.trim().is_empty() {
+            return Err("Webhook URL is not configured".to_string());
+        }
+
+        let payload = render_version_update_template(&config.update_template, event, true);
         self.send_webhook_raw(config, &payload).await
     }
 
@@ -393,6 +494,25 @@ impl NotificationSender {
         .await
     }
 
+    async fn send_bark_version_update(
+        &self,
+        config: &BarkConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !should_send_update(&config.common) {
+            return Ok("Bark skipped".to_string());
+        }
+        if config.device_key.trim().is_empty() {
+            return Err("Bark device key is not configured".to_string());
+        }
+        self.send_bark_message(
+            config,
+            "SimAdmin 版本更新".to_string(),
+            render_version_update_template(&config.common.update_template, event, false),
+        )
+        .await
+    }
+
     async fn send_bark_message(
         &self,
         config: &BarkConfig,
@@ -475,6 +595,20 @@ impl NotificationSender {
             .await
     }
 
+    async fn send_pushplus_version_update(
+        &self,
+        config: &PushPlusConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !should_send_update(&config.common) {
+            return Ok("PushPlus skipped".to_string());
+        }
+
+        let content = render_version_update_template(&config.common.update_template, event, false);
+        self.send_pushplus_message(config, "SimAdmin 版本更新".to_string(), content)
+            .await
+    }
+
     async fn send_pushplus_message(
         &self,
         config: &PushPlusConfig,
@@ -538,6 +672,18 @@ impl NotificationSender {
             return Ok("企业微信应用消息 skipped".to_string());
         }
         let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_wecom_app_text(config, text).await
+    }
+
+    async fn send_wecom_app_version_update(
+        &self,
+        config: &WecomAppConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !should_send_update(&config.common) {
+            return Ok("企业微信应用消息 skipped".to_string());
+        }
+        let text = render_version_update_template(&config.common.update_template, event, false);
         self.send_wecom_app_text(config, text).await
     }
 
@@ -753,6 +899,18 @@ impl NotificationSender {
         self.send_wecom_robot_text(config, text).await
     }
 
+    async fn send_wecom_robot_version_update(
+        &self,
+        config: &WecomRobotConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !should_send_update(&config.common) {
+            return Ok("企业微信群机器人 skipped".to_string());
+        }
+        let text = render_version_update_template(&config.common.update_template, event, false);
+        self.send_wecom_robot_text(config, text).await
+    }
+
     async fn send_wecom_robot_text(
         &self,
         config: &WecomRobotConfig,
@@ -806,6 +964,18 @@ impl NotificationSender {
             return Ok("钉钉群自定义机器人 skipped".to_string());
         }
         let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_dingtalk_robot_text(config, text).await
+    }
+
+    async fn send_dingtalk_robot_version_update(
+        &self,
+        config: &DingtalkRobotConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !should_send_update(&config.common) {
+            return Ok("钉钉群自定义机器人 skipped".to_string());
+        }
+        let text = render_version_update_template(&config.common.update_template, event, false);
         self.send_dingtalk_robot_text(config, text).await
     }
 
@@ -880,6 +1050,18 @@ impl NotificationSender {
             return Ok("钉钉企业内部机器人 skipped".to_string());
         }
         let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_dingtalk_app_text(config, text).await
+    }
+
+    async fn send_dingtalk_app_version_update(
+        &self,
+        config: &DingtalkAppConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !should_send_update(&config.common) {
+            return Ok("钉钉企业内部机器人 skipped".to_string());
+        }
+        let text = render_version_update_template(&config.common.update_template, event, false);
         self.send_dingtalk_app_text(config, text).await
     }
 
@@ -1013,6 +1195,18 @@ impl NotificationSender {
         self.send_feishu_robot_text(config, text).await
     }
 
+    async fn send_feishu_robot_version_update(
+        &self,
+        config: &FeishuRobotConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !should_send_update(&config.common) {
+            return Ok("飞书机器人 skipped".to_string());
+        }
+        let text = render_version_update_template(&config.common.update_template, event, false);
+        self.send_feishu_robot_text(config, text).await
+    }
+
     async fn send_feishu_robot_text(
         &self,
         config: &FeishuRobotConfig,
@@ -1073,6 +1267,18 @@ impl NotificationSender {
             return Ok("Telegram skipped".to_string());
         }
         let text = render_ddns_template(&config.common.ddns_template, event, false);
+        self.send_telegram_text(config, text).await
+    }
+
+    async fn send_telegram_version_update(
+        &self,
+        config: &TelegramConfig,
+        event: &VersionUpdateEvent,
+    ) -> Result<String, String> {
+        if !should_send_update(&config.common) {
+            return Ok("Telegram skipped".to_string());
+        }
+        let text = render_version_update_template(&config.common.update_template, event, false);
         self.send_telegram_text(config, text).await
     }
 
@@ -1159,11 +1365,39 @@ fn should_send_ddns(config: &MessageChannelConfig) -> bool {
     config.enabled && config.forward_ddns
 }
 
+fn should_send_update(config: &MessageChannelConfig) -> bool {
+    config.enabled && config.forward_updates
+}
+
+fn should_send_update_to_channel(
+    channel: NotificationChannel,
+    config: &NotificationConfig,
+) -> bool {
+    match channel {
+        NotificationChannel::Webhook => config.webhook.enabled && config.webhook.forward_updates,
+        NotificationChannel::Bark => should_send_update(&config.bark.common),
+        NotificationChannel::PushPlus => should_send_update(&config.pushplus.common),
+        NotificationChannel::WecomApp => should_send_update(&config.wecom_app.common),
+        NotificationChannel::WecomRobot => should_send_update(&config.wecom_robot.common),
+        NotificationChannel::DingtalkRobot => should_send_update(&config.dingtalk_robot.common),
+        NotificationChannel::DingtalkApp => should_send_update(&config.dingtalk_app.common),
+        NotificationChannel::FeishuRobot => should_send_update(&config.feishu_robot.common),
+        NotificationChannel::Telegram => should_send_update(&config.telegram.common),
+    }
+}
+
 const DEFAULT_DDNS_TEXT_TEMPLATE: &str = "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}";
 const DEFAULT_DDNS_JSON_TEMPLATE: &str = r#"{
   "msg_type": "text",
   "content": {
     "text": "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}"
+  }
+}"#;
+const DEFAULT_UPDATE_TEXT_TEMPLATE: &str = "SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n构建时间: {{build_time}}\nOTA包 MD5: {{md5}}\n\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。";
+const DEFAULT_UPDATE_JSON_TEMPLATE: &str = r#"{
+  "msg_type": "text",
+  "content": {
+    "text": "SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n构建时间: {{build_time}}\nOTA包 MD5: {{md5}}\n\n请前往 OTA 更新页面的在线更新模块检查更新，可一键下载并升级。"
   }
 }"#;
 
@@ -1227,6 +1461,60 @@ fn render_ddns_template(template: &str, event: &DdnsEvent, escape_json: bool) ->
         .replace("{{状态}}", &status)
         .replace("{{消息}}", &message)
         .replace("{{更新时间}}", &timestamp)
+}
+
+fn render_version_update_template(
+    template: &str,
+    event: &VersionUpdateEvent,
+    escape_json: bool,
+) -> String {
+    let template = if template.trim().is_empty() && escape_json {
+        DEFAULT_UPDATE_JSON_TEMPLATE
+    } else if template.trim().is_empty() {
+        DEFAULT_UPDATE_TEXT_TEMPLATE
+    } else {
+        template
+    };
+
+    let maybe_escape = |value: &str| {
+        if escape_json {
+            escape_json_string(value)
+        } else {
+            value.to_string()
+        }
+    };
+    let asset_name = maybe_escape(&event.asset_name);
+    let version = maybe_escape(&event.version);
+    let commit = maybe_escape(&event.commit);
+    let build_time_value = format_notification_time(&event.build_time);
+    let build_time = maybe_escape(&build_time_value);
+    let md5 = maybe_escape(&event.md5);
+    let binary_md5 = maybe_escape(&event.binary_md5);
+    let frontend_md5 = maybe_escape(&event.frontend_md5);
+    let release_url = maybe_escape(&event.release_url);
+    let timestamp_value = format_notification_time(&event.timestamp);
+    let timestamp = maybe_escape(&timestamp_value);
+
+    template
+        .replace("{{asset_name}}", &asset_name)
+        .replace("{{file_name}}", &asset_name)
+        .replace("{{firmware_name}}", &asset_name)
+        .replace("{{version}}", &version)
+        .replace("{{commit}}", &commit)
+        .replace("{{Commit}}", &commit)
+        .replace("{{build_time}}", &build_time)
+        .replace("{{md5}}", &md5)
+        .replace("{{MD5}}", &md5)
+        .replace("{{binary_md5}}", &binary_md5)
+        .replace("{{frontend_md5}}", &frontend_md5)
+        .replace("{{release_url}}", &release_url)
+        .replace("{{timestamp}}", &timestamp)
+        .replace("{{time}}", &timestamp)
+        .replace("{{固件包}}", &asset_name)
+        .replace("{{文件名}}", &asset_name)
+        .replace("{{版本号}}", &version)
+        .replace("{{构建时间}}", &build_time)
+        .replace("{{发布时间}}", &timestamp)
 }
 
 fn robot_webhook_url(webhook_url: &str, key: &str, prefix: &str) -> Result<String, String> {
@@ -1530,6 +1818,30 @@ mod tests {
         assert_eq!(
             render_ddns_template("{{timestamp}}|{{time}}|{{更新时间}}", &event, false),
             "2026-05-15 00:30:45|2026-05-15 00:30:45|2026-05-15 00:30:45"
+        );
+    }
+
+    #[test]
+    fn renders_version_update_build_time_as_beijing_time() {
+        let event = VersionUpdateEvent {
+            asset_name: "simadmin_1.0.4.tar.gz".to_string(),
+            version: "1.0.4".to_string(),
+            commit: "abc1234".to_string(),
+            build_time: "2026-05-14T16:30:45Z".to_string(),
+            md5: "package-md5".to_string(),
+            binary_md5: "binary-md5".to_string(),
+            frontend_md5: "frontend-md5".to_string(),
+            release_url: "https://github.com/3899/SimAdmin/releases/tag/v1.0.4".to_string(),
+            timestamp: "2026-05-14T17:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            render_version_update_template(
+                "{{asset_name}}|{{version}}|{{Commit}}|{{build_time}}|{{MD5}}",
+                &event,
+                false
+            ),
+            "simadmin_1.0.4.tar.gz|1.0.4|abc1234|2026-05-15 00:30:45|package-md5"
         );
     }
 

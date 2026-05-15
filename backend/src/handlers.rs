@@ -3,16 +3,16 @@
 //! 包含所有 HTTP API 的处理函数
 
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use serde_json::json;
 use std::fs;
 use std::process::{Command, Output};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 use zbus::Connection;
 
@@ -2048,100 +2048,18 @@ pub async fn upload_ota_handler(body: axum::body::Bytes) -> impl IntoResponse {
     }
 }
 
-#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
-struct GitHubReleaseAsset {
-    name: String,
-    size: u64,
-    browser_download_url: String,
-}
-
-#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
-struct GitHubRelease {
-    tag_name: String,
-    name: Option<String>,
-    published_at: String,
-    target_commitish: Option<String>,
-    body: Option<String>,
-    html_url: Option<String>,
-    assets: Vec<GitHubReleaseAsset>,
-}
-
-async fn fetch_latest_github_release(
-    client: &reqwest::Client,
-    proxy_prefix: &str,
-) -> Result<GitHubRelease, String> {
-    const LATEST_RELEASE_API: &str = "https://api.github.com/repos/3899/SimAdmin/releases/latest";
-
-    let mut urls = vec![LATEST_RELEASE_API.to_string()];
-    if !proxy_prefix.is_empty() {
-        urls.push(format!("{}{}", proxy_prefix, LATEST_RELEASE_API));
-    }
-
-    let mut last_error = String::new();
-    for url in urls {
-        match client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    last_error = format!("GitHub Releases request failed: HTTP {}", status);
-                    continue;
-                }
-                return response
-                    .json::<GitHubRelease>()
-                    .await
-                    .map_err(|e| format!("Failed to parse latest release: {}", e));
-            }
-            Err(e) => {
-                last_error = format!("Failed to request latest release: {}", e);
-            }
-        }
-    }
-
-    if last_error.is_empty() {
-        Err("GitHub Releases request failed".to_string())
-    } else {
-        Err(last_error)
-    }
-}
-
-fn normalize_proxy_prefix(prefix: Option<String>) -> String {
-    let Some(prefix) = prefix else {
-        return String::new();
-    };
-    let prefix = prefix.trim();
-    if prefix.is_empty() {
-        return String::new();
-    }
-    if prefix.ends_with('/') {
-        prefix.to_string()
-    } else {
-        format!("{}/", prefix)
-    }
-}
-
-fn is_supported_ota_asset(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")
-}
-
 /// POST /api/ota/latest-release
 pub async fn get_latest_ota_release_handler(
     Json(req): Json<crate::models::OtaOnlinePrepareRequest>,
 ) -> impl IntoResponse {
-    let result: Result<GitHubRelease, String> = async {
-        let proxy_prefix = normalize_proxy_prefix(req.proxy_prefix);
+    let result: Result<crate::models::OtaLatestReleaseResponse, String> = async {
+        let proxy_prefix = crate::ota::normalize_proxy_prefix(req.proxy_prefix);
         let client = reqwest::Client::builder()
             .user_agent("SimAdmin OTA updater")
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        fetch_latest_github_release(&client, &proxy_prefix).await
+        crate::ota::fetch_latest_github_release(&client, &proxy_prefix).await
     }
     .await;
 
@@ -2152,7 +2070,7 @@ pub async fn get_latest_ota_release_handler(
         ),
         Err(e) => (
             StatusCode::OK,
-            Json(ApiResponse::<GitHubRelease>::error(format!(
+            Json(ApiResponse::<crate::models::OtaLatestReleaseResponse>::error(format!(
                 "Failed: {}. GitHub may have rate-limited this request; try again later or enable a proxy.",
                 e
             ))),
@@ -2164,27 +2082,23 @@ pub async fn get_latest_ota_release_handler(
 pub async fn prepare_online_ota_handler(
     Json(req): Json<crate::models::OtaOnlinePrepareRequest>,
 ) -> impl IntoResponse {
-    const MAX_OTA_BYTES: u64 = 50 * 1024 * 1024;
-
     let result: Result<crate::models::OtaUploadResponse, String> = async {
-        let proxy_prefix = normalize_proxy_prefix(req.proxy_prefix);
+        let proxy_prefix = crate::ota::normalize_proxy_prefix(req.proxy_prefix);
         let client = reqwest::Client::builder()
             .user_agent("SimAdmin OTA updater")
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        let release = fetch_latest_github_release(&client, &proxy_prefix).await?;
+        let release = crate::ota::fetch_latest_github_release(&client, &proxy_prefix).await?;
 
-        let asset = release
-            .assets
-            .iter()
-            .find(|asset| is_supported_ota_asset(&asset.name))
+        let asset = crate::ota::supported_release_asset(&release)
             .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?;
 
-        if asset.size > MAX_OTA_BYTES {
+        if asset.size > crate::ota::MAX_OTA_BYTES {
             return Err(format!(
                 "OTA asset is too large: {} bytes exceeds {} bytes",
-                asset.size, MAX_OTA_BYTES
+                asset.size,
+                crate::ota::MAX_OTA_BYTES
             ));
         }
 
@@ -2200,11 +2114,11 @@ pub async fn prepare_online_ota_handler(
             .await
             .map_err(|e| format!("Failed to read OTA asset: {}", e))?;
 
-        if bytes.len() as u64 > MAX_OTA_BYTES {
+        if bytes.len() as u64 > crate::ota::MAX_OTA_BYTES {
             return Err(format!(
                 "OTA asset is too large: {} bytes exceeds {} bytes",
                 bytes.len(),
-                MAX_OTA_BYTES
+                crate::ota::MAX_OTA_BYTES
             ));
         }
 

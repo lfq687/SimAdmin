@@ -46,8 +46,10 @@ import {
   DEFAULT_DDNS_TEMPLATE,
   DEFAULT_PLAIN_CALL_TEMPLATE,
   DEFAULT_PLAIN_DDNS_TEMPLATE,
+  DEFAULT_PLAIN_UPDATE_TEMPLATE,
   DEFAULT_PLAIN_SMS_TEMPLATE,
   DEFAULT_SMS_TEMPLATE,
+  DEFAULT_UPDATE_TEMPLATE,
 } from '../api/current'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 
@@ -118,6 +120,14 @@ const DDNS_TEMPLATE_VARIABLES = [
   { label: '更新时间', displayToken: '{{更新时间}}', backendToken: '{{timestamp}}' },
 ] as const
 
+const UPDATE_TEMPLATE_VARIABLES = [
+  { label: '固件包', displayToken: '{{固件包}}', backendToken: '{{asset_name}}' },
+  { label: '版本号', displayToken: '{{版本号}}', backendToken: '{{version}}' },
+  { label: 'Commit', displayToken: '{{Commit}}', backendToken: '{{commit}}' },
+  { label: '构建时间', displayToken: '{{构建时间}}', backendToken: '{{build_time}}' },
+  { label: 'MD5', displayToken: '{{MD5}}', backendToken: '{{md5}}' },
+] as const
+
 function replaceAll(input: string, search: string, replacement: string) {
   return input.split(search).join(replacement)
 }
@@ -139,9 +149,11 @@ function toBackendTemplate(template: string, variables: readonly { displayToken:
 const DEFAULT_SMS_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_SMS_TEMPLATE, SMS_TEMPLATE_VARIABLES)
 const DEFAULT_CALL_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_CALL_TEMPLATE, CALL_TEMPLATE_VARIABLES)
 const DEFAULT_DDNS_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_DDNS_TEMPLATE, DDNS_TEMPLATE_VARIABLES)
+const DEFAULT_UPDATE_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_UPDATE_TEMPLATE, UPDATE_TEMPLATE_VARIABLES)
 const DEFAULT_PLAIN_SMS_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_PLAIN_SMS_TEMPLATE, SMS_TEMPLATE_VARIABLES)
 const DEFAULT_PLAIN_CALL_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_PLAIN_CALL_TEMPLATE, CALL_TEMPLATE_VARIABLES)
 const DEFAULT_PLAIN_DDNS_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_PLAIN_DDNS_TEMPLATE, DDNS_TEMPLATE_VARIABLES)
+const DEFAULT_PLAIN_UPDATE_DISPLAY_TEMPLATE = toDisplayTemplate(DEFAULT_PLAIN_UPDATE_TEMPLATE, UPDATE_TEMPLATE_VARIABLES)
 
 function baseMessageConfig() {
   return {
@@ -149,9 +161,11 @@ function baseMessageConfig() {
     forward_sms: true,
     forward_calls: true,
     forward_ddns: true,
+    forward_updates: true,
     sms_template: DEFAULT_PLAIN_SMS_DISPLAY_TEMPLATE,
     call_template: DEFAULT_PLAIN_CALL_DISPLAY_TEMPLATE,
     ddns_template: DEFAULT_PLAIN_DDNS_DISPLAY_TEMPLATE,
+    update_template: DEFAULT_PLAIN_UPDATE_DISPLAY_TEMPLATE,
   }
 }
 
@@ -163,11 +177,13 @@ function createDefaultNotificationConfig(): NotificationConfig {
       forward_sms: true,
       forward_calls: true,
       forward_ddns: true,
+      forward_updates: true,
       headers: {},
       secret: '',
       sms_template: DEFAULT_SMS_DISPLAY_TEMPLATE,
       call_template: DEFAULT_CALL_DISPLAY_TEMPLATE,
       ddns_template: DEFAULT_DDNS_DISPLAY_TEMPLATE,
+      update_template: DEFAULT_UPDATE_DISPLAY_TEMPLATE,
     },
     bark: {
       ...baseMessageConfig(),
@@ -240,21 +256,23 @@ function createDefaultNotificationConfig(): NotificationConfig {
   }
 }
 
-function withTemplateDisplay<T extends { sms_template: string; call_template: string; ddns_template: string }>(channel: T): T {
+function withTemplateDisplay<T extends { sms_template: string; call_template: string; ddns_template: string; update_template: string }>(channel: T): T {
   return {
     ...channel,
     sms_template: toDisplayTemplate(channel.sms_template, SMS_TEMPLATE_VARIABLES),
     call_template: toDisplayTemplate(channel.call_template, CALL_TEMPLATE_VARIABLES),
     ddns_template: toDisplayTemplate(channel.ddns_template, DDNS_TEMPLATE_VARIABLES),
+    update_template: toDisplayTemplate(channel.update_template, UPDATE_TEMPLATE_VARIABLES),
   }
 }
 
-function withTemplateBackend<T extends { sms_template: string; call_template: string; ddns_template: string }>(channel: T): T {
+function withTemplateBackend<T extends { sms_template: string; call_template: string; ddns_template: string; update_template: string }>(channel: T): T {
   return {
     ...channel,
     sms_template: toBackendTemplate(channel.sms_template, SMS_TEMPLATE_VARIABLES),
     call_template: toBackendTemplate(channel.call_template, CALL_TEMPLATE_VARIABLES),
     ddns_template: toBackendTemplate(channel.ddns_template, DDNS_TEMPLATE_VARIABLES),
+    update_template: toBackendTemplate(channel.update_template, UPDATE_TEMPLATE_VARIABLES),
   }
 }
 
@@ -355,6 +373,7 @@ export default function NotificationCenterPage() {
   const [newHeaderValue, setNewHeaderValue] = useState('')
   const smsTemplateInputRef = useRef<HTMLTextAreaElement | null>(null)
   const ddnsTemplateInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const updateTemplateInputRef = useRef<HTMLTextAreaElement | null>(null)
 
   const loadConfig = useCallback(async () => {
     setLoading(true)
@@ -452,6 +471,21 @@ export default function NotificationCenterPage() {
     })
   }
 
+  const handleInsertUpdateVariable = (displayToken: string) => {
+    const input = updateTemplateInputRef.current
+    const template = selectedConfig.update_template
+    const selectionStart = input?.selectionStart ?? template.length
+    const selectionEnd = input?.selectionEnd ?? template.length
+    const nextTemplate = `${template.slice(0, selectionStart)}${displayToken}${template.slice(selectionEnd)}`
+    patchChannel(selectedChannel, { update_template: nextTemplate })
+
+    window.requestAnimationFrame(() => {
+      input?.focus()
+      const nextCursor = selectionStart + displayToken.length
+      input?.setSelectionRange(nextCursor, nextCursor)
+    })
+  }
+
   const handleSave = async () => {
     setSaving(true)
     setError(null)
@@ -512,6 +546,16 @@ export default function NotificationCenterPage() {
           />
         }
         label="DDNS 变更"
+      />
+      <FormControlLabel
+        control={
+          <Switch
+            checked={config[channel].forward_updates}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => patchChannel(channel, { forward_updates: event.target.checked })}
+            disabled={!config[channel].enabled}
+          />
+        }
+        label="版本更新"
       />
       {/*
       <FormControlLabel
@@ -632,6 +676,58 @@ export default function NotificationCenterPage() {
         disabled={!config[channel].enabled}
       >
         重置为默认 DDNS 模板
+      </Button>
+
+      <Divider sx={{ my: 2.5 }} />
+      <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
+        版本更新通知模板
+        {jsonTemplate && <Chip label="JSON" size="small" variant="outlined" />}
+      </Typography>
+      <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" mb={2.5}>
+        <Typography variant="body2" color="text.secondary" sx={{ mr: 0.5 }}>
+          版本变量：
+        </Typography>
+        {UPDATE_TEMPLATE_VARIABLES.map((variable) => (
+          <Chip
+            key={variable.displayToken}
+            label={`+ ${variable.label}`}
+            size="small"
+            variant="outlined"
+            clickable
+            disabled={!config[channel].enabled}
+            onClick={() => handleInsertUpdateVariable(variable.displayToken)}
+          />
+        ))}
+      </Box>
+      <TextField
+        fullWidth
+        label={jsonTemplate ? '版本更新通知 Payload' : '版本更新通知模板'}
+        inputRef={channel === selectedChannel ? updateTemplateInputRef : undefined}
+        value={config[channel].update_template}
+        onChange={(event: ChangeEvent<HTMLInputElement>) => patchChannel(channel, { update_template: event.target.value })}
+        multiline
+        rows={jsonTemplate ? 8 : 7}
+        disabled={!config[channel].enabled}
+        sx={{ mb: 2 }}
+        InputProps={{
+          sx: {
+            fontFamily: 'monospace',
+            fontSize: '0.85rem',
+            '& textarea': {
+              lineHeight: 1.75,
+            },
+          },
+        }}
+      />
+      <Button
+        size="small"
+        variant="outlined"
+        onClick={() => patchChannel(channel, {
+          update_template: channel === 'webhook' ? DEFAULT_UPDATE_DISPLAY_TEMPLATE : DEFAULT_PLAIN_UPDATE_DISPLAY_TEMPLATE,
+        })}
+        disabled={!config[channel].enabled}
+      >
+        重置为默认版本更新模板
       </Button>
     </Box>
   )

@@ -197,6 +197,27 @@ async fn main() -> Result<()> {
         });
     }
 
+    {
+        let config_clone = Arc::clone(&config_manager);
+        let notification_clone = Arc::clone(&notification_sender);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(crate::ota::duration_until_next_update_check()).await;
+                let config = config_clone.get_version_update_notifications();
+                if config.enabled {
+                    if let Err(err) = crate::ota::check_and_notify_version_update(
+                        Arc::clone(&config_clone),
+                        Arc::clone(&notification_clone),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, "Version update notification check failed");
+                    }
+                }
+            }
+        });
+    }
+
     // 启动 SMS 监听线程
     {
         let conn_clone = Connection::system().await?;

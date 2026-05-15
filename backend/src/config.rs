@@ -22,6 +22,8 @@ pub struct WebhookConfig {
     pub forward_calls: bool,
     #[serde(default = "default_true")]
     pub forward_ddns: bool,
+    #[serde(default = "default_true")]
+    pub forward_updates: bool,
     #[serde(default)]
     pub headers: HashMap<String, String>,
     #[serde(default)]
@@ -32,6 +34,8 @@ pub struct WebhookConfig {
     pub call_template: String, // 通话 payload 模板
     #[serde(default = "default_ddns_template")]
     pub ddns_template: String, // DDNS payload 模板
+    #[serde(default = "default_update_template")]
+    pub update_template: String, // 版本更新 payload 模板
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,12 +48,16 @@ pub struct MessageChannelConfig {
     pub forward_calls: bool,
     #[serde(default = "default_true")]
     pub forward_ddns: bool,
+    #[serde(default = "default_true")]
+    pub forward_updates: bool,
     #[serde(default = "default_plain_sms_template")]
     pub sms_template: String,
     #[serde(default = "default_plain_call_template")]
     pub call_template: String,
     #[serde(default = "default_plain_ddns_template")]
     pub ddns_template: String,
+    #[serde(default = "default_plain_update_template")]
+    pub update_template: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +241,17 @@ pub struct DeviceNetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct VersionUpdateNotificationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub proxy_prefix: String,
+    #[serde(default)]
+    pub last_notified_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct DdnsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -302,6 +321,16 @@ fn default_ddns_template() -> String {
     .to_string()
 }
 
+fn default_update_template() -> String {
+    r#"{
+  "msg_type": "text",
+  "content": {
+    "text": "SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n构建时间: {{build_time}}\nOTA包 MD5: {{md5}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。"
+  }
+}"#
+    .to_string()
+}
+
 fn default_plain_sms_template() -> String {
     "📱 短信通知\n发送方: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}".to_string()
 }
@@ -312,6 +341,10 @@ fn default_plain_call_template() -> String {
 
 fn default_plain_ddns_template() -> String {
     "SimAdmin DDNS 通知\n域名: {{domains}}\nIP类型: {{ip_type}}\n新IP: {{new_ip}}\n旧IP: {{old_ip}}\n服务商: {{provider}}\n记录类型: {{record_type}}\n状态: {{status}}\n消息: {{message}}\n更新时间: {{timestamp}}".to_string()
+}
+
+fn default_plain_update_template() -> String {
+    "SimAdmin 发现新版本\n固件包: {{asset_name}}\n版本号: {{version}}\nCommit: {{commit}}\n构建时间: {{build_time}}\nOTA包 MD5: {{md5}}\n\n请前往 OTA 在线更新模块检测版本，一键下载并升级。".to_string()
 }
 
 fn default_sms_title_template() -> String {
@@ -342,11 +375,13 @@ impl Default for WebhookConfig {
             forward_sms: true,
             forward_calls: true,
             forward_ddns: true,
+            forward_updates: true,
             headers: HashMap::new(),
             secret: String::new(),
             sms_template: default_sms_template(),
             call_template: default_call_template(),
             ddns_template: default_ddns_template(),
+            update_template: default_update_template(),
         }
     }
 }
@@ -358,9 +393,11 @@ impl Default for MessageChannelConfig {
             forward_sms: true,
             forward_calls: true,
             forward_ddns: true,
+            forward_updates: true,
             sms_template: default_plain_sms_template(),
             call_template: default_plain_call_template(),
             ddns_template: default_plain_ddns_template(),
+            update_template: default_plain_update_template(),
         }
     }
 }
@@ -497,6 +534,16 @@ impl Default for DeviceNetworkConfig {
     }
 }
 
+impl Default for VersionUpdateNotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            proxy_prefix: String::new(),
+            last_notified_version: None,
+        }
+    }
+}
+
 impl Default for DdnsConfig {
     fn default() -> Self {
         Self {
@@ -593,6 +640,8 @@ pub struct AppConfig {
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub device_network: DeviceNetworkConfig,
+    #[serde(default)]
+    pub version_update_notifications: VersionUpdateNotificationConfig,
     /// 是否允许蜂窝数据漫游（写入 ModemManager Simple.Connect 的 allow-roaming）
     #[serde(default = "default_roaming_allowed")]
     pub roaming_allowed: bool,
@@ -606,6 +655,7 @@ impl Default for AppConfig {
             webhook: WebhookConfig::default(),
             notifications: NotificationConfig::default(),
             device_network: DeviceNetworkConfig::default(),
+            version_update_notifications: VersionUpdateNotificationConfig::default(),
             roaming_allowed: default_roaming_allowed(),
             data_enabled: default_data_enabled(),
         }
@@ -685,6 +735,14 @@ impl ConfigManager {
         self.config.read().unwrap().device_network.ddns.clone()
     }
 
+    pub fn get_version_update_notifications(&self) -> VersionUpdateNotificationConfig {
+        self.config
+            .read()
+            .unwrap()
+            .version_update_notifications
+            .clone()
+    }
+
     pub fn set_data_enabled(&self, enabled: bool) -> Result<(), String> {
         {
             let mut c = self.config.write().unwrap();
@@ -705,6 +763,14 @@ impl ConfigManager {
         {
             let mut c = self.config.write().unwrap();
             c.device_network.ddns = ddns;
+        }
+        self.save()
+    }
+
+    pub fn set_last_notified_update_version(&self, version: String) -> Result<(), String> {
+        {
+            let mut c = self.config.write().unwrap();
+            c.version_update_notifications.last_notified_version = Some(version);
         }
         self.save()
     }

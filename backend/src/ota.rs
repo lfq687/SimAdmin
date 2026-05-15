@@ -2,11 +2,19 @@
 //!
 //! 处理 OTA 更新包的上传、验证和应用
 
-use crate::models::{OtaMeta, OtaStatusResponse, OtaUploadResponse, OtaValidation};
+use crate::config::ConfigManager;
+use crate::models::{
+    OtaLatestReleaseResponse, OtaMeta, OtaReleaseAsset, OtaStatusResponse, OtaUploadResponse,
+    OtaValidation, VersionUpdateEvent,
+};
+use crate::notification::NotificationSender;
+use chrono::{DateTime, FixedOffset, NaiveTime, TimeZone, Utc};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// OTA 相关路径
 const OTA_STAGING_DIR: &str = "/tmp/ota_staging";
@@ -17,6 +25,11 @@ const OTA_SERVICE_NAME: &str = "simadmin.service";
 const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
 const NM_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf";
 const NM_UNMANAGED_WWAN_CONFIG: &str = "[keyfile]\nunmanaged-devices=interface-name:wwan*\n";
+const LATEST_RELEASE_API: &str = "https://api.github.com/repos/3899/SimAdmin/releases/latest";
+const OTA_NOTICE_TMP_PREFIX: &str = "/tmp/simadmin_update_notice";
+const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+const UPDATE_CHECK_HOUR: u32 = 10;
+pub const MAX_OTA_BYTES: u64 = 50 * 1024 * 1024;
 
 /// 当前版本信息（编译时注入）
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -36,6 +49,262 @@ pub fn get_ota_status() -> OtaStatusResponse {
         pending_update: pending_meta.is_some(),
         pending_meta,
     }
+}
+
+pub fn duration_until_next_update_check() -> Duration {
+    duration_until_next_update_check_from(Utc::now())
+}
+
+fn duration_until_next_update_check_from(now_utc: DateTime<Utc>) -> Duration {
+    let beijing = beijing_offset();
+    let now = now_utc.with_timezone(&beijing);
+    let check_time =
+        NaiveTime::from_hms_opt(UPDATE_CHECK_HOUR, 0, 0).expect("valid update check time");
+    let today_check = beijing
+        .from_local_datetime(&now.date_naive().and_time(check_time))
+        .single()
+        .expect("fixed offset has a single local time");
+    let next_check = if now <= today_check {
+        today_check
+    } else {
+        today_check + chrono::Duration::days(1)
+    };
+
+    (next_check - now)
+        .to_std()
+        .unwrap_or_else(|_| Duration::from_secs(0))
+}
+
+pub fn normalize_proxy_prefix(prefix: Option<String>) -> String {
+    let Some(prefix) = prefix else {
+        return String::new();
+    };
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return String::new();
+    }
+    if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{}/", prefix)
+    }
+}
+
+pub fn is_supported_ota_asset(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")
+}
+
+pub fn supported_release_asset(release: &OtaLatestReleaseResponse) -> Option<&OtaReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .find(|asset| is_supported_ota_asset(&asset.name))
+}
+
+pub async fn fetch_latest_github_release(
+    client: &reqwest::Client,
+    proxy_prefix: &str,
+) -> Result<OtaLatestReleaseResponse, String> {
+    let mut urls = vec![LATEST_RELEASE_API.to_string()];
+    if !proxy_prefix.is_empty() {
+        urls.push(format!("{}{}", proxy_prefix, LATEST_RELEASE_API));
+    }
+
+    let mut last_error = String::new();
+    for url in urls {
+        match client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    last_error = format!("GitHub Releases request failed: HTTP {}", status);
+                    continue;
+                }
+                return response
+                    .json::<OtaLatestReleaseResponse>()
+                    .await
+                    .map_err(|e| format!("Failed to parse latest release: {}", e));
+            }
+            Err(e) => {
+                last_error = format!("Failed to request latest release: {}", e);
+            }
+        }
+    }
+
+    if last_error.is_empty() {
+        Err("GitHub Releases request failed".to_string())
+    } else {
+        Err(last_error)
+    }
+}
+
+pub async fn check_and_notify_version_update(
+    config_manager: Arc<ConfigManager>,
+    notification_sender: Arc<NotificationSender>,
+) -> Result<(), String> {
+    let update_config = config_manager.get_version_update_notifications();
+    if !update_config.enabled || !notification_sender.has_version_update_targets() {
+        return Ok(());
+    }
+
+    let proxy_prefix = normalize_proxy_prefix(Some(update_config.proxy_prefix));
+    let client = reqwest::Client::builder()
+        .user_agent("SimAdmin OTA updater")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let release = fetch_latest_github_release(&client, &proxy_prefix).await?;
+
+    if !compare_versions(&release.tag_name, CURRENT_VERSION) {
+        return Ok(());
+    }
+
+    let notify_version = normalize_version(&release.tag_name);
+    if update_config
+        .last_notified_version
+        .as_deref()
+        .map(normalize_version)
+        .as_deref()
+        == Some(notify_version.as_str())
+    {
+        return Ok(());
+    }
+
+    let asset = supported_release_asset(&release)
+        .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?;
+    let (meta, package_md5) = fetch_release_asset_meta(&client, &proxy_prefix, asset).await?;
+    let event = VersionUpdateEvent {
+        asset_name: asset.name.clone(),
+        version: if meta.version.trim().is_empty() {
+            notify_version.clone()
+        } else {
+            meta.version.clone()
+        },
+        commit: if meta.commit.trim().is_empty() {
+            release.target_commitish.clone().unwrap_or_default()
+        } else {
+            meta.commit.clone()
+        },
+        build_time: meta.build_time.clone(),
+        md5: package_md5,
+        binary_md5: meta.binary_md5.clone(),
+        frontend_md5: meta.frontend_md5.clone(),
+        release_url: release.html_url.clone().unwrap_or_default(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let result = notification_sender
+        .forward_version_update_event(&event)
+        .await?;
+
+    if result.delivered {
+        config_manager.set_last_notified_update_version(notify_version)?;
+    }
+    if !result.errors.is_empty() {
+        tracing::warn!(
+            errors = %result.errors.join("; "),
+            "Version update notification partially failed"
+        );
+    }
+
+    Ok(())
+}
+
+async fn fetch_release_asset_meta(
+    client: &reqwest::Client,
+    proxy_prefix: &str,
+    asset: &OtaReleaseAsset,
+) -> Result<(OtaMeta, String), String> {
+    if asset.size > MAX_OTA_BYTES {
+        return Err(format!(
+            "OTA asset is too large: {} bytes exceeds {} bytes",
+            asset.size, MAX_OTA_BYTES
+        ));
+    }
+
+    let download_url = format!("{}{}", proxy_prefix, asset.browser_download_url);
+    let bytes = client
+        .get(&download_url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download OTA asset metadata: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("OTA asset metadata download failed: {}", e))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read OTA asset metadata: {}", e))?;
+
+    if bytes.len() as u64 > MAX_OTA_BYTES {
+        return Err(format!(
+            "OTA asset is too large: {} bytes exceeds {} bytes",
+            bytes.len(),
+            MAX_OTA_BYTES
+        ));
+    }
+
+    let package_md5 = format!("{:x}", md5::compute(&bytes));
+    let meta = read_ota_meta_from_archive(&asset.name, &bytes)?;
+    Ok((meta, package_md5))
+}
+
+fn read_ota_meta_from_archive(asset_name: &str, data: &[u8]) -> Result<OtaMeta, String> {
+    let tmp_dir = PathBuf::from(format!(
+        "{}_{}",
+        OTA_NOTICE_TMP_PREFIX,
+        current_timestamp_millis()
+    ));
+    fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("Failed to create OTA metadata temp dir: {}", e))?;
+
+    let archive_name = if detect_zip_format(data) {
+        "update.zip"
+    } else if asset_name.to_ascii_lowercase().ends_with(".zip") {
+        "update.zip"
+    } else {
+        "update.tar.gz"
+    };
+    let archive_path = tmp_dir.join(archive_name);
+
+    let result = (|| {
+        let mut file = fs::File::create(&archive_path)
+            .map_err(|e| format!("Failed to create OTA metadata temp file: {}", e))?;
+        file.write_all(data)
+            .map_err(|e| format!("Failed to write OTA metadata temp file: {}", e))?;
+
+        let output = if archive_name.ends_with(".zip") {
+            Command::new("unzip")
+                .arg("-p")
+                .arg(&archive_path)
+                .arg("meta.json")
+                .output()
+                .map_err(|e| format!("Failed to read OTA zip metadata: {}", e))?
+        } else {
+            Command::new("tar")
+                .arg("-xOzf")
+                .arg(&archive_path)
+                .arg("meta.json")
+                .output()
+                .map_err(|e| format!("Failed to read OTA tar metadata: {}", e))?
+        };
+
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to extract OTA metadata: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        serde_json::from_slice::<OtaMeta>(&output.stdout)
+            .map_err(|e| format!("Invalid OTA metadata: {}", e))
+    })();
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+    result
 }
 
 /// 读取待安装的更新元数据
@@ -214,8 +483,13 @@ fn calculate_file_md5(path: &str) -> Result<String, String> {
 }
 
 /// 比较版本号（返回 v1 > v2）
-fn compare_versions(v1: &str, v2: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
+pub fn compare_versions(v1: &str, v2: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> {
+        normalize_version(v)
+            .split(['.', '-'])
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    };
 
     let v1_parts = parse(v1);
     let v2_parts = parse(v2);
@@ -230,6 +504,21 @@ fn compare_versions(v1: &str, v2: &str) -> bool {
         }
     }
     false
+}
+
+fn normalize_version(version: &str) -> String {
+    version.trim().trim_start_matches(['v', 'V']).to_string()
+}
+
+fn beijing_offset() -> FixedOffset {
+    FixedOffset::east_opt(BEIJING_UTC_OFFSET_SECONDS).expect("valid Beijing UTC offset")
+}
+
+fn current_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 /// 应用 OTA 更新
@@ -446,6 +735,33 @@ fn detect_zip_format(data: &[u8]) -> bool {
 
     // 检查是否是 ZIP 格式
     data[0] == 0x50 && data[1] == 0x4B && data[2] == 0x03 && data[3] == 0x04
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compares_release_tag_versions() {
+        assert!(compare_versions("v1.0.4", "1.0.3"));
+        assert!(!compare_versions("v1.0.3", "1.0.3"));
+        assert!(!compare_versions("v1.0.2", "1.0.3"));
+    }
+
+    #[test]
+    fn schedules_next_update_check_at_ten_beijing_time() {
+        let before_ten = Utc.with_ymd_and_hms(2026, 5, 15, 1, 59, 0).unwrap();
+        assert_eq!(
+            duration_until_next_update_check_from(before_ten),
+            Duration::from_secs(60)
+        );
+
+        let after_ten = Utc.with_ymd_and_hms(2026, 5, 15, 2, 1, 0).unwrap();
+        assert_eq!(
+            duration_until_next_update_check_from(after_ten),
+            Duration::from_secs(23 * 60 * 60 + 59 * 60)
+        );
+    }
 }
 
 /// 修复文件权限（用于 ZIP 解压后）

@@ -336,7 +336,7 @@ journalctl -u simadmin -f
 | 蜂窝网络 | `/network` | 网络注册、服务小区和邻区、运营商扫描、APN、射频模式、频段锁定、小区锁定状态 |
 | 设备网络 | `/device-network` | WLAN 客户端联网、无线网络扫描和连接、DDNS 动态解析配置和同步日志 |
 | 短信管理 | `/sms` | 接收短信、发送短信、短信列表、会话、统计、删除对话、删除短信 |
-| 通知中心 | `/notifications` | 多渠道通知配置、短信转发、DDNS转发、测试发送 |
+| 通知中心 | `/notifications` | 多渠道通知配置、短信转发、DDNS转发、版本更新提醒、测试发送 |
 | 系统配置 | `/config` | 设备操作、数据连接、漫游、飞行模式、基带重启、服务重启、系统重启等 |
 | OTA 更新 | `/ota` | 上传 OTA 包、在线获取 Release、验证、应用或取消更新 |
 
@@ -363,6 +363,7 @@ journalctl -u simadmin -f
 #### ✨ 新增功能
 
 - 通知中心新增 PushPlus 通知渠道，支持配置 Token、标题模板、群组编码、消息模板、发送渠道、渠道参数和回调地址，并接入短信、DDNS 事件转发及测试发送。
+- 通知中心新增版本更新提醒：后台每天北京时间 10:00 检测一次，发现新版本时按渠道首次提醒一次，不对检测失败或无更新场景推送通知。
 
 #### 🐞 bug 修复
 
@@ -744,7 +745,7 @@ busctl introspect org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1/M
 - Telegram 机器人。
 - `sms_template` 模板。
 
-模板变量包括短信号码、内容、方向、状态和时间等字段。
+模板变量包括短信号码、内容、方向、状态和时间等字段。版本更新模板支持固件包名、版本号、Commit、构建时间和 OTA 包 MD5；构建时间会按北京时间展示。
 
 ### OTA 更新
 
@@ -769,7 +770,7 @@ www/
 
 ```json
 {
-  "version": "1.0.3",
+  "version": "1.0.4",
   "commit": "abcdef0",
   "build_time": "2026-05-06T00:00:00Z",
   "binary_md5": "md5-of-binary",

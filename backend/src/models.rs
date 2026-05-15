@@ -809,6 +809,37 @@ pub struct OtaOnlinePrepareRequest {
     pub proxy_prefix: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct OtaReleaseAsset {
+    pub name: String,
+    pub size: u64,
+    pub browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct OtaLatestReleaseResponse {
+    pub tag_name: String,
+    pub name: Option<String>,
+    pub published_at: String,
+    pub target_commitish: Option<String>,
+    pub body: Option<String>,
+    pub html_url: Option<String>,
+    pub assets: Vec<OtaReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VersionUpdateEvent {
+    pub asset_name: String,
+    pub version: String,
+    pub commit: String,
+    pub build_time: String,
+    pub md5: String,
+    pub binary_md5: String,
+    pub frontend_md5: String,
+    pub release_url: String,
+    pub timestamp: String,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct OtaValidation {
     pub valid: bool,
